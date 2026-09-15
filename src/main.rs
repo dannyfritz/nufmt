@@ -20,7 +20,8 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::convert::TryFrom;
 use std::{
     collections::BTreeMap,
-    io::{self, Write},
+    fs::File,
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
 
@@ -87,6 +88,12 @@ struct Cli {
     )]
     stdin: bool,
 
+    #[arg(
+        long,
+        help = "Check contents of files to detect script with shebangs for nu"
+    )]
+    check_for_shebang: bool,
+
     #[arg(short, long, help = "nufmt configuration file")]
     config: Option<PathBuf>,
 }
@@ -118,6 +125,10 @@ fn main() {
 
     trace!("received cli.files: {:?}", cli.files);
     trace!("received cli.stdin: {:?}", cli.stdin);
+    trace!(
+        "received cli.check_for_shebang: {:?}",
+        cli.check_for_shebang
+    );
     trace!("received cli.all: {:?}", cli.all);
     trace!("received cli.all_recurse: {:?}", cli.all_recurse);
     trace!("received cli.config: {:?}", cli.config);
@@ -141,7 +152,7 @@ fn main() {
             (cli.files, true)
         };
 
-        format_files_from_paths(paths, &config, cli.dry_run, recurse)
+        format_files_from_paths(paths, &config, cli.dry_run, recurse, cli.check_for_shebang)
     };
 
     std::io::stdout()
@@ -197,14 +208,16 @@ fn format_files_from_paths(
     config: &Config,
     dry_run: bool,
     recurse: bool,
+    check_for_shebang: bool,
 ) -> ExitCode {
-    let (target_files, invalid_files) = match discover_nu_files(paths, &config.excludes, recurse) {
-        Ok(files) => files,
-        Err(err) => {
-            eprintln!("{}: {}", Color::LightRed.paint("error"), err);
-            return ExitCode::Failure;
-        }
-    };
+    let (target_files, invalid_files) =
+        match discover_nu_files(paths, &config.excludes, recurse, check_for_shebang) {
+            Ok(files) => files,
+            Err(err) => {
+                eprintln!("{}: {}", Color::LightRed.paint("error"), err);
+                return ExitCode::Failure;
+            }
+        };
 
     let mode = if dry_run {
         Mode::DryRun
@@ -364,6 +377,7 @@ fn discover_nu_files(
     paths: Vec<PathBuf>,
     excludes: &[String],
     recurse: bool,
+    check_for_shebang: bool,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), ConfigError> {
     let (valid_paths, invalid_paths): (Vec<_>, Vec<_>) =
         paths.into_iter().partition(|p| p.exists());
@@ -382,7 +396,7 @@ fn discover_nu_files(
                 .overrides(overrides.clone())
                 .build()
                 .filter_map(Result::ok)
-                .filter(is_nu_file)
+                .filter(|entry| is_nu_file(entry, check_for_shebang))
                 .map(|entry| entry.into_path())
         })
         .collect();
@@ -413,9 +427,27 @@ fn build_overrides(excludes: &[String]) -> Result<ignore::overrides::Override, C
 }
 
 /// Return whether a `DirEntry` is a .nu file
-fn is_nu_file(entry: &DirEntry) -> bool {
+fn is_nu_file(entry: &DirEntry, check_for_shebang: bool) -> bool {
     entry.file_type().is_some_and(|ft| ft.is_file())
-        && entry.path().extension().is_some_and(|ext| ext == "nu")
+        && (entry.path().extension().is_some_and(|ext| ext == "nu")
+            || (check_for_shebang && entry.path().extension().is_none() && has_nu_shebang(entry)))
+}
+
+/// Return whether a `DirEntry` has a nu shebang at the top such as "#!/usr/bin/env nu"
+fn has_nu_shebang(entry: &DirEntry) -> bool {
+    let Ok(file) = File::open(entry.path()) else {
+        return false;
+    };
+    let Some(Ok(first_line)) = BufReader::new(file).lines().next() else {
+        return false;
+    };
+    let first_line = first_line.trim();
+    let is_shebang = first_line.starts_with("#!");
+    let is_nu = first_line.contains(" nu ")
+        || first_line.ends_with(" nu")
+        || first_line.contains("/nu ")
+        || first_line.ends_with("/nu");
+    is_shebang && is_nu
 }
 
 /// Convert a path to a relative path string for display
